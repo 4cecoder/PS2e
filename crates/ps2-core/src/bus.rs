@@ -45,6 +45,15 @@ pub struct EeDmaChannel {
     sadr: u32,
 }
 
+impl EeDmaChannel {
+    /// Mirror the upper 16 bits of a fetched DMAtag (IRQ, ID, PCE, etc.) into
+    /// `Dn_CHCR[31:16]`, matching EE DMAC hardware (EE User's Manual §4.4.1).
+    #[inline]
+    fn latch_tag(&mut self, tag_lo: u32) {
+        self.chcr = (self.chcr & 0x0000_FFFF) | (tag_lo & 0xFFFF_0000);
+    }
+}
+
 const EE_CHCR_STR: u32 = 1 << 8;
 const EE_CHCR_TTE: u32 = 1 << 6;
 const EE_CHCR_TIE: u32 = 1 << 7;
@@ -3057,6 +3066,7 @@ impl Bus {
             }
             // Source-chain tag.
             let tag = self.ee_dma_read128(self.dma_vif0.tadr);
+            self.dma_vif0.latch_tag(tag[0]);
             let qwc = tag[0] & 0xFFFF;
             let id = (tag[0] >> 28) & 7;
             let irq = tag[0] & 0x8000_0000 != 0;
@@ -3188,6 +3198,7 @@ impl Bus {
             }
             // Source-chain tag.
             let tag = self.ee_dma_read128(self.dma_vif1.tadr);
+            self.dma_vif1.latch_tag(tag[0]);
             let qwc = tag[0] & 0xFFFF;
             let id = (tag[0] >> 28) & 7;
             let irq = tag[0] & 0x8000_0000 != 0;
@@ -3334,6 +3345,7 @@ impl Bus {
                 break;
             }
             let tag = self.ee_dma_read128(self.dma_ipu_to.tadr);
+            self.dma_ipu_to.latch_tag(tag[0]);
             let qwc = tag[0] & 0xFFFF;
             let id = (tag[0] >> 28) & 7;
             let addr = tag[1] & 0xFFFF_FFF0;
@@ -3545,6 +3557,7 @@ impl Bus {
         let irq = tag[0] & 0x8000_0000 != 0;
         let addr = tag[1] & 0xFFFF_FFF0;
         let ch = if to { &mut self.dma_spr_to } else { &mut self.dma_spr_from };
+        ch.latch_tag(tag[0]);
         if !to {
             // Destination chain: the tag names where in memory its run
             // lands, and the data follows it in the scratchpad. Only
@@ -3679,6 +3692,7 @@ impl Bus {
             }
             // Source-chain tag.
             let tag = self.ee_dma_read128(self.dma_gif.tadr);
+            self.dma_gif.latch_tag(tag[0]);
             let qwc = tag[0] & 0xFFFF;
             let id = (tag[0] >> 28) & 7;
             let irq = tag[0] & 0x8000_0000 != 0;
@@ -3978,6 +3992,7 @@ impl Bus {
             } else {
                 // Fetch the next source-chain tag.
                 let tag = self.ee_dma_read128(self.dma_sif1.tadr);
+                self.dma_sif1.latch_tag(tag[0]);
                 let qwc = tag[0] & 0xFFFF;
                 let id = (tag[0] >> 28) & 7;
                 let irq = tag[0] & 0x8000_0000 != 0;
@@ -4264,6 +4279,7 @@ impl Bus {
                 let w1 = self.sif.fifo0.pop_front().unwrap();
                 self.sif.fifo0.pop_front();
                 self.sif.fifo0.pop_front();
+                self.dma_sif0.latch_tag(w0);
                 self.dma_sif0.qwc = w0 & 0xFFFF;
                 self.dma_sif0.madr = w1 & 0x1FFF_FFF0;
                 let id = (w0 >> 28) & 7;
