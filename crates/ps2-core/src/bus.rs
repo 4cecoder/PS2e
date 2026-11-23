@@ -2181,6 +2181,8 @@ impl Bus {
             }
             0x1200_0000..=0x1200_1FFF => self.read_gs_priv::<N>(addr),
             0x1C00_0000..=0x1C1F_FFFF => read_le::<N>(&self.iop_ram, (addr & 0x1F_FFFF) as usize),
+            // IOP-side SIF MMIO window seen from the EE over the SBUS bridge.
+            0x1D00_0000..=0x1D00_00FF => self.sif.iop_read(addr) as u64,
             0x1F80_0000..=0x1F80_FFFF => {
                 // IOP MMIO window as seen from the EE.
                 self.warn_stub(addr, "IOP MMIO window seen from the EE");
@@ -2238,6 +2240,15 @@ impl Bus {
                 let off = (addr & 0x1F_FFFF) as usize;
                 write_le::<N>(&mut self.iop_ram, off, v);
                 self.iop_ram_written(off, N);
+            }
+            // IOP-side SIF MMIO window seen from the EE over the SBUS bridge
+            // (e.g. sceSifStopDma / BIOS writes to 0xBD00_0040).
+            0x1D00_0000..=0x1D00_00FF => {
+                self.sif.iop_write(addr, v as u32);
+                if addr & 0xF0 == 0x30 {
+                    self.intc_stat |= 1 << 1;
+                    self.intc_changed();
+                }
             }
             0x1F80_0000..=0x1F80_FFFF => {
                 self.warn_stub(addr, "IOP MMIO window seen from the EE");
@@ -2329,10 +2340,22 @@ impl Bus {
             // direction. The mask bits would come from GIF_MODE, which
             // nothing has needed yet.
             0x1000_3020 => 0,
-            // VIF0_STAT / VIF1_STAT. Same story — the parser is never caught
-            // mid-code. FDR is kept as written; GS-to-EE readback through the
-            // FIFO is not modelled, and a set FDR is warned about on write.
-            0x1000_3800 | 0x1000_3C00 => read_le::<4>(&self.mmio, off & !3) & VIF_STAT_FDR,
+            // VIF0_STAT / VIF1_STAT: expose bit 11 (INT) when stalled on a
+            // VIFcode `I`-bit interrupt, plus FDR on VIF1.
+            0x1000_3800 => {
+                let mut s = read_le::<4>(&self.mmio, off & !3) & VIF_STAT_FDR;
+                if self.vif0.stalled() {
+                    s |= 1 << 11;
+                }
+                s
+            }
+            0x1000_3C00 => {
+                let mut s = read_le::<4>(&self.mmio, off & !3) & VIF_STAT_FDR;
+                if self.vif1.stalled() {
+                    s |= 1 << 11;
+                }
+                s
+            }
             0x1000_8000 => self.dma_vif0.chcr as u64,
             0x1000_8010 => self.dma_vif0.madr as u64,
             0x1000_8020 => self.dma_vif0.qwc as u64,
@@ -2616,10 +2639,47 @@ impl Bus {
                 }
                 return;
             }
+            // VIF0_FBRST / VIF0_ERR
+            0x1000_3810 => {
+                if v & 1 != 0 {
+                    self.vif0.reset();
+                }
+                if v & 8 != 0 {
+                    self.vif0
+                        .clear_stall(&mut self.gs, &mut self.gif, &mut self.vu0);
+                    self.vif0_check_irq();
+                    if !self.vif0.stalled() && self.dma_vif0.chcr & EE_CHCR_STR != 0 {
+                        self.pump_vif0();
+                    }
+                }
+                return;
+            }
+            0x1000_3820 => {
+                self.vif0.set_mii(v & 1 != 0);
+            }
             // VIF1_STAT is read-only apart from FDR, which picks the FIFO's
             // direction. Nothing has needed the GS-to-EE side yet.
             0x1000_3C00 if v & u64::from(VIF_STAT_FDR) != 0 => {
                 warn!(target: "ps2_core::bus::vif", "VIF1 GS-to-EE readback requested (not modelled)");
+            }
+            // VIF1_FBRST: RST (bit 0) resets parser/FIFO; STC (bit 3) clears
+            // an `I`-bit stall and resumes any in-flight VIF1 DMA chain.
+            0x1000_3C10 => {
+                if v & 1 != 0 {
+                    self.vif1.reset();
+                }
+                if v & 8 != 0 {
+                    self.vif1
+                        .clear_stall(&mut self.gs, &mut self.gif, &mut self.vu1);
+                    self.vif1_check_irq();
+                    if !self.vif1.stalled() && self.dma_vif1.chcr & EE_CHCR_STR != 0 {
+                        self.pump_vif1();
+                    }
+                }
+                return;
+            }
+            0x1000_3C20 => {
+                self.vif1.set_mii(v & 1 != 0);
             }
             // VIF1 FIFO: direct programmed writes feed the same parser.
             0x1000_5000..=0x1000_5FF0 => {
@@ -2628,6 +2688,7 @@ impl Bus {
                     self.vif1
                         .push_word(&mut self.gs, &mut self.gif, &mut self.vu1, w);
                 }
+                self.vif1_check_irq();
                 return;
             }
             // EE DMAC SIF channels: starting a transfer pumps it to completion.
@@ -3077,11 +3138,29 @@ impl Bus {
         }
     }
 
-    /// Run the GIF channel (ch2) to completion: normal or source chain.
+    fn vif0_check_irq(&mut self) {
+        if self.vif0.take_irq() {
+            self.intc_stat |= 1 << 4;
+            self.intc_changed();
+        }
+    }
+
+    fn vif1_check_irq(&mut self) {
+        if self.vif1.take_irq() {
+            self.intc_stat |= 1 << 5;
+            self.intc_changed();
+        }
+    }
+
+    /// Run the VIF1 channel (ch1) until completion or a VIFcode `I`-bit stall.
     fn pump_vif1(&mut self) {
         let _p = prof::scope(prof::Slot::Vif1);
         let mut guard = 0u32;
         while self.dma_vif1.chcr & EE_CHCR_STR != 0 {
+            self.vif1_check_irq();
+            if self.vif1.stalled() {
+                break;
+            }
             guard += 1;
             if guard > 1_000_000 {
                 warn!(target: "ps2_core::bus::dma", "VIF1 DMA hit its iteration limit");
@@ -3095,6 +3174,7 @@ impl Bus {
                 }
                 self.dma_vif1.madr = self.dma_vif1.madr.wrapping_add(16);
                 self.dma_vif1.qwc -= 1;
+                self.vif1_check_irq();
                 continue;
             }
             // Block finished.
@@ -3186,6 +3266,7 @@ impl Bus {
                     .push_word(&mut self.gs, &mut self.gif, &mut self.vu1, tag[3]);
             }
             self.dma_vif1.qwc = qwc;
+            self.vif1_check_irq();
         }
     }
 
@@ -3887,7 +3968,8 @@ impl Bus {
                 }
                 self.dma_sif1.qwc = 0;
                 progressed = true;
-                if self.dma_sif1.tag_end {
+                let normal = (self.dma_sif1.chcr >> 2) & 3 == 0;
+                if normal || self.dma_sif1.tag_end {
                     self.dma_sif1.chcr &= !EE_CHCR_STR;
                     self.dma_sif1.tag_end = false;
                     self.ee_dma_irq(6);
@@ -3977,8 +4059,8 @@ impl Bus {
                 self.sif.fifo1.pop_front();
                 ch.recv_addr = w0 & 0xFF_FFFF;
                 ch.recv_start = ch.recv_addr;
-                ch.recv_left = w1;
-                ch.recv_pad = (4 - (w1 & 3)) & 3;
+                ch.recv_left = w1 & 0xFF_FFFF;
+                ch.recv_pad = (4 - (ch.recv_left & 3)) & 3;
                 ch.recv_end = w0 & 0xC000_0000 != 0;
                 trace!(
                     target: "ps2_core::bus::sifdma",
