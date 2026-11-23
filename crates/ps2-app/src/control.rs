@@ -411,7 +411,7 @@ fn format_regs(sys: &Ps2System, which: &str) -> Result<String, String> {
                 b.dma_vif1.qwc,
                 b.dma_vif1.tadr
             );
-            let _ = write!(
+            let _ = writeln!(
                 out,
                 "gif_chcr={:#010x} sif0_chcr={:#010x} sif1_chcr={:#010x} sif_mscom={:#010x} sif_smcom={:#010x} sif_msflag={:#010x} sif_smflag={:#010x} sif_ctrl={:#010x} fifo0={} fifo1={}",
                 b.dma_gif.chcr,
@@ -425,6 +425,16 @@ fn format_regs(sys: &Ps2System, which: &str) -> Result<String, String> {
                 b.sif.fifo0.len(),
                 b.sif.fifo1.len(),
             );
+            for t in 0..4u32 {
+                let base = 0x1000_0000 + (t << 11);
+                let cnt = b.timers.read(base, b.now, b.region);
+                let mode = b.timers.read(base + 0x10, b.now, b.region);
+                let comp = b.timers.read(base + 0x20, b.now, b.region);
+                let _ = write!(out, "t{t}(cnt={cnt:#06x},mode={mode:#06x},comp={comp:#06x})");
+                if t < 3 {
+                    out.push(' ');
+                }
+            }
             Ok(out)
         }
         _ => Err(format!("bad regs target '{which}' (want ee, iop, or hw)")),
