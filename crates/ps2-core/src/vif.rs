@@ -168,7 +168,7 @@ impl Vif {
     /// padding bytes are dropped when the last write lands (the stream is
     /// word-aligned per unpack).
     fn unpack_drain(&mut self, vu1: &mut Vu1) {
-        let (mask, row, col) = (self.mask, self.row, self.col);
+        let (mask, mut row, col, stmod) = (self.mask, self.row, self.col, self.stmod);
         let cl = if self.cl == 0 { 256 } else { self.cl };
         let wl = if self.wl == 0 { 256 } else { self.wl };
         let State::Unpack {
@@ -254,7 +254,15 @@ impl Vif {
                     };
                     match code {
                         0 => {
-                            if let Some(v) = elem {
+                            if let Some(mut v) = elem {
+                                match stmod {
+                                    1 => v = v.wrapping_add(row[f]),
+                                    2 => {
+                                        v = v.wrapping_add(row[f]);
+                                        row[f] = v;
+                                    }
+                                    _ => {}
+                                }
                                 write_field(&mut vu1.data, f, v);
                             }
                         }
@@ -278,6 +286,7 @@ impl Vif {
         if *writes_left == 0 {
             self.state = State::Cmd;
         }
+        self.row = row;
     }
 
     /// Feed one 32-bit word of the VIF stream. If currently stalled on an
@@ -374,11 +383,11 @@ impl Vif {
             0x03 => self.base = imm & 0x3FF,
             0x04 => self.itops = imm & 0x3FF,
             0x05 => {
-                // STMOD: row-addition modes are not implemented yet.
+                // STMOD: 0 = normal, 1 = offset (+ROW), 2 = difference (+ROW, ROW = result).
                 self.stmod = imm & 3;
-                if self.stmod != 0 && !self.warned_stmod {
+                if self.stmod == 3 && !self.warned_stmod {
                     self.warned_stmod = true;
-                    warn!(target: "ps2_core::vif", mode = self.stmod, "STMOD addition mode ignored (reported once)");
+                    warn!(target: "ps2_core::vif", mode = self.stmod, "reserved STMOD mode 3 treated as normal (reported once)");
                 }
             }
             // MSKPATH3/MARK: accepted so the stream stays in sync.
@@ -632,5 +641,21 @@ mod tests {
         r.feed(&[0x8000_0000, 0x0000_0000]);
         assert!(!r.vif.stalled());
         assert!(!r.vif.take_irq());
+    }
+
+    #[test]
+    fn stmod_offset_and_difference_add_row() {
+        let mut r = Rig::new();
+        // STROW = [10, 20, 30, 40]
+        r.feed(&[0x3000_0000, 10, 20, 30, 40]);
+        // STMOD = 1 (Offset): UNPACK V4-32, 1 write of [1, 2, 3, 4] -> [11, 22, 33, 44]
+        r.feed(&[0x0500_0001, 0x6C01_0000, 1, 2, 3, 4]);
+        assert_eq!(u32::from_le_bytes(r.vu1.data[0..4].try_into().unwrap()), 11);
+        assert_eq!(u32::from_le_bytes(r.vu1.data[12..16].try_into().unwrap()), 44);
+        // STMOD = 2 (Difference): 2 writes of [1, 1, 1, 1] -> [11, 21, 31, 41], then [12, 22, 32, 42]
+        r.feed(&[0x0500_0002, 0x6C02_0001, 1, 1, 1, 1, 1, 1, 1, 1]);
+        assert_eq!(u32::from_le_bytes(r.vu1.data[16..20].try_into().unwrap()), 11);
+        assert_eq!(u32::from_le_bytes(r.vu1.data[32..36].try_into().unwrap()), 12);
+        assert_eq!(u32::from_le_bytes(r.vu1.data[44..48].try_into().unwrap()), 42);
     }
 }
